@@ -1,0 +1,61 @@
+name: Publish RPM repository
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: rpm-pages
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:43
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build RPM and repository
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          dnf -y install rpm-build rpm-sign createrepo_c gnupg2 python3
+          topdir="$RUNNER_TEMP/rpmbuild"
+          mkdir -p "$topdir/SOURCES" site/r4.3
+          cp qubes-template-upgrade.py LICENSE "$topdir/SOURCES/"
+          python3 qubes-template-upgrade.py --help
+          rpmbuild -bb --define "_topdir $topdir" --define "_rpmformat 4" \
+            --define "dist .fc41" packaging/qubes-template-upgrade.spec
+          cp "$topdir"/RPMS/noarch/*.rpm site/r4.3/
+
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$SIGNING_KEY" | gpg --batch --import
+          key=packaging/RPM-GPG-KEY-qubes-dom0-tools
+          fingerprint="$(gpg --batch --show-keys --with-colons "$key" | awk -F: '$1 == "fpr" && !seen++ { print $10 }')"
+          rpmsign --key-id "$fingerprint" --addsign site/r4.3/*.rpm
+          rpmkeys --import "$key"
+          rpmkeys --checksig site/r4.3/*.rpm
+          createrepo_c site/r4.3
+          gpg --batch --local-user "$fingerprint" --armor --detach-sign site/r4.3/repodata/repomd.xml
+          gpg --batch --verify site/r4.3/repodata/repomd.xml.asc site/r4.3/repodata/repomd.xml
+          cp "$key" packaging/qubes-dom0-tools.repo site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: pages
+        uses: actions/deploy-pages@v4
